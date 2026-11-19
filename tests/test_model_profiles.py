@@ -27,6 +27,7 @@ from custom_components.iletcomfort.api import (
 from custom_components.iletcomfort.model_profiles import (
     AQUAPURA_SN8,
     ATW_SN8,
+    KJR86T3_SN8,
     KJRH120L2_SN8,
     KJRH120L_DHW_OFF,
     KJRH120L_DHW_ON,
@@ -37,10 +38,14 @@ from custom_components.iletcomfort.model_profiles import (
     apply_profile_to_sensors,
     apply_profile_to_status,
     atw_sensors_are_placeholder,
+    build_kjr86t3_table_query,
     build_kjrh120l_set_temperature,
     build_query_command,
     decode_atw_status,
+    decode_kjr86t3_sensors,
+    decode_kjr86t3_status,
     decode_kjrh120l_status,
+    kjr86t3_table_matches,
     resolve_profile,
 )
 
@@ -781,3 +786,114 @@ def patch_send(client, return_value):
     from unittest.mock import patch
 
     return patch.object(client, "send_hex_command", return_value=return_value)
+
+
+# --- KJR-86T3 table profile (sn8 17186T3A, issue #126) ---
+# Real reply bodies captured from an AQS Energie AQUAPURA unit; the ODU serial
+# in table 1000 is zeroed. Values were cross-checked against the official app.
+KJR86T3_TABLE_500 = bytes.fromhex(
+    "0001f4ffff83ff00ffffff15ff0140022600ffff01ffff00ff000032ffffffff"
+    "ffffff00"
+)
+KJR86T3_TABLE_900 = bytes.fromhex(
+    "000384ffff83ff00ffffff150000000000ff000001ff0000000000ffffff023f"
+    "2f0000000000000000000000ffffffffffffffff"
+)
+KJR86T3_TABLE_1000 = bytes.fromhex(
+    "0003e8ffff83ff00ffffff0fffff00000000ff01e0ffffffff00000000ffff00"
+    "eaffffffff0000ffffffff00e400b100a700c1ffffffffffff7fff7fff7fffff"
+    "ffffffffff0000ffffffffffff003200647fff00000000cff4ffffffffffffff"
+    "ffffffffffffffffff0000028d0000028d00000000ffffffff00ffffff000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000056380000000000000000000000000000ffff00"
+    "00"
+)
+
+
+def _kjr86t3_frame(body: bytes) -> str:
+    header = bytes([0xAA, 0x00, 0xC3, 0, 0, 0, 0, 0, 0, 0x03])
+    return (header + body + b"\x00").hex()
+
+
+def test_resolve_profile_kjr86t3_sn8():
+    assert resolve_profile(KJR86T3_SN8) is ModelProfile.KJR86T3
+
+
+def test_build_kjr86t3_table_query_matches_hardware_validated_frame():
+    # The device only answers the zero-padded 16-byte body; this exact frame
+    # returned table 500 on hardware.
+    assert (
+        build_kjr86t3_table_query(500)
+        == "aa1ac3000000000000030101f4000000000000000000000000002a"
+    )
+
+
+def test_kjr86t3_table_matches_rejects_echoed_request():
+    echoed = bytes.fromhex(build_kjr86t3_table_query(500))[10:-1]
+    assert not kjr86t3_table_matches(echoed, 500)
+    assert kjr86t3_table_matches(KJR86T3_TABLE_500, 500)
+    assert not kjr86t3_table_matches(KJR86T3_TABLE_500, 900)
+
+
+def test_decode_kjr86t3_status_fields():
+    status = decode_kjr86t3_status(KJR86T3_TABLE_500, KJR86T3_TABLE_1000)
+    assert status.mode == 1
+    assert status.t5s_def == 55.0
+    assert status.set_temperature == 55
+    assert status.total_kwh == 532.36
+    assert status.error_code == 0
+    # Not exposed by this controller: unavailable rather than a fake 0.
+    assert status.comp_running is None
+    assert status.comp_frq is None
+
+
+def test_decode_kjr86t3_status_power_off():
+    body = bytearray(KJR86T3_TABLE_500)
+    body[13] = 0x00
+    status = decode_kjr86t3_status(body, KJR86T3_TABLE_1000)
+    assert status.mode == 0
+    assert status.mode_name == "Off"
+
+
+def test_decode_kjr86t3_sensors_fields():
+    sensors = decode_kjr86t3_sensors(KJR86T3_TABLE_1000, KJR86T3_TABLE_900)
+    assert sensors.th_temp == 57.5  # DHW tank, routed to the tank sensor
+    assert sensors.t4_temp == 19.3
+    assert sensors.t3_temp == 16.7
+    assert sensors.tp_temp == 22.8
+    assert sensors.odu_voltage == 234
+    assert sensors.twin_temp is None
+    assert sensors.tf_temp is None
+
+
+def test_query_status_kjr86t3_reads_tables_500_and_1000():
+    from unittest.mock import patch
+
+    client = _make_client()
+    replies = {
+        build_kjr86t3_table_query(500): _kjr86t3_frame(KJR86T3_TABLE_500),
+        build_kjr86t3_table_query(1000): _kjr86t3_frame(KJR86T3_TABLE_1000),
+    }
+    with patch.object(client, "send_hex_command", side_effect=lambda _c, cmd: replies[cmd]):
+        status = client.query_status("APPL1", sn8=KJR86T3_SN8)
+    assert status.t5s_def == 55.0
+    assert status.total_kwh == 532.36
+
+
+def test_query_kjr86t3_table_echo_raises():
+    from custom_components.iletcomfort.api import ApiError
+
+    client = _make_client()
+    command = build_kjr86t3_table_query(500)
+    with patch_send(client, command), pytest.raises(ApiError):
+        client.query_kjr86t3_table("APPL1", 500)
+
+
+def test_set_device_kjr86t3_never_sends_a_frame():
+    from custom_components.iletcomfort.api import ApiError
+
+    client = _make_client()
+    with patch_send(client, "") as send, pytest.raises(ApiError):
+        client.set_device("APPL1", sn8=KJR86T3_SN8, temperature=50)
+    send.assert_not_called()

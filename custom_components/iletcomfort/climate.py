@@ -28,6 +28,8 @@ from .const import DOMAIN
 from .coordinator import ILetComfortCoordinator
 from .entity import build_device_info
 from .model_profiles import (
+    KJR86T3_TEMP_MAX,
+    KJR86T3_TEMP_MIN,
     KJRH120L_TEMP_MAX,
     KJRH120L_TEMP_MIN,
     ModelProfile,
@@ -106,6 +108,13 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
         return resolve_profile(self.coordinator.sn8)
 
     @property
+    def hvac_modes(self) -> list[HVACMode]:
+        # The KJR-86T3 is a DHW-only heat pump water heater.
+        if self._profile is ModelProfile.KJR86T3:
+            return [HVACMode.OFF, HVACMode.HEAT]
+        return self._attr_hvac_modes
+
+    @property
     def _is_kjrh120l_dual(self) -> bool:
         return (
             self._profile is ModelProfile.KJRH120L
@@ -135,6 +144,8 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
     def current_temperature(self) -> float | None:
         if self._sensors is None:
             return None
+        if self._profile is ModelProfile.KJR86T3:
+            return self._sensors.th_temp
         # ATW exposes its meaningful current value as the DHW tank temperature.
         if self._profile is ModelProfile.ATW:
             # The confirmed Galmet sensor template contains no Zone-1 telemetry;
@@ -183,6 +194,8 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
         # above the air-side HEAT range (issue #35).
         if self._profile is ModelProfile.KJRH120L:
             return float(KJRH120L_TEMP_MIN)
+        if self._profile is ModelProfile.KJR86T3:
+            return float(KJR86T3_TEMP_MIN)
         set_mode = _HVAC_TO_SET_MODE.get(self.hvac_mode)
         if set_mode is not None and set_mode in TEMP_RANGES:
             return float(TEMP_RANGES[set_mode][0])
@@ -192,6 +205,8 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
     def max_temp(self) -> float:
         if self._profile is ModelProfile.KJRH120L:
             return float(KJRH120L_TEMP_MAX)
+        if self._profile is ModelProfile.KJR86T3:
+            return float(KJR86T3_TEMP_MAX)
         set_mode = _HVAC_TO_SET_MODE.get(self.hvac_mode)
         if set_mode is not None and set_mode in TEMP_RANGES:
             return float(TEMP_RANGES[set_mode][1])

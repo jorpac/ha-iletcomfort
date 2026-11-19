@@ -62,6 +62,7 @@ ATW_SN8 = "171H120F"
 AQUAPURA_SN8 = "171000AU"
 KJRH120L_SN8 = "17100003"
 KJRH120L2_SN8 = "17100007"  # Known catalogue entry; no validated profile yet.
+KJR86T3_SN8 = "17186T3A"
 
 
 class ModelProfile(Enum):
@@ -71,12 +72,14 @@ class ModelProfile(Enum):
     ATW = "atw"
     AQUAPURA = "aquapura"
     KJRH120L = "kjrh120l"
+    KJR86T3 = "kjr86t3"
 
 
 _SN8_PROFILES: dict[str, ModelProfile] = {
     ATW_SN8: ModelProfile.ATW,
     AQUAPURA_SN8: ModelProfile.AQUAPURA,
     KJRH120L_SN8: ModelProfile.KJRH120L,
+    KJR86T3_SN8: ModelProfile.KJR86T3,
 }
 
 
@@ -435,6 +438,139 @@ def build_kjrh120l_set_temperature(temp: int) -> str:
     return "000701%02xff" % temp
 
 
+# ---------------------------------------------------------------------------
+# KJR-86T3 table profile (sn8 17186T3A, AQS Energie AQUAPURA variant, #126)
+# ---------------------------------------------------------------------------
+#
+# This wired controller ignores every standard C3 query (the cloud echoes the
+# command back). It answers "table" queries instead: message type 0x03 with a
+# 16-byte body ``01 <table u16 BE>`` zero-padded; the same body without the
+# padding is echoed too. The official app reads tables 0/100/400/500/600/610/
+# 900/1000 via ``luaQuery({"u16_table": N})``.
+#
+# Reply body (frame[10:-1]): [0]=00, [1..2]=table, [5]=series (0x83), [11]=
+# period, then table data. u16 values are big-endian signed; temperatures are
+# x10. 0x7fff/0xffff mark an unused field. Offsets below were matched against
+# the app's own decoded luaQuery JSON captured at the same moment.
+KJR86T3_TABLE_LIMITS = 100
+KJR86T3_TABLE_SETTINGS = 500
+KJR86T3_TABLE_ICONS = 900
+KJR86T3_TABLE_PARAMS = 1000
+KJR86T3_QUERY_BODY_LEN = 16
+
+KJR86T3_POWER_INDEX = 13  # table 500, u8s_power_on
+KJR86T3_SETPOINT_INDEX = 15  # table 500, u16s_t5s (x10)
+KJR86T3_TANK_TEMP_INDEX = 30  # table 900, u16_icons_temp (x10)
+KJR86T3_TP_INDEX = 43  # table 1000, u16_parm_tp (x10)
+KJR86T3_TH_INDEX = 45  # table 1000, u16_parm_th (x10)
+KJR86T3_T3_INDEX = 47  # table 1000, u16_parm_t3 (x10)
+KJR86T3_T4_INDEX = 49  # table 1000, u16_parm_t4 (x10)
+KJR86T3_VOLTAGE_INDEX = 31  # table 1000, u16_parm_voltage
+KJR86T3_ENERGY_INDEX = 85  # table 1000, u32_parm_ap (x100, kWh)
+# DHW setpoint range reported by table 100 (u16_t5s_min / u16_t5s_max).
+KJR86T3_TEMP_MIN = 38
+KJR86T3_TEMP_MAX = 70
+
+_KJR86T3_INVALID_U16 = (0x7FFF, 0xFFFF)
+
+# Fields this controller does not expose; None keeps their entities
+# unavailable instead of showing a misleading 0.
+_KJR86T3_UNEXPOSED_STATUS = {
+    "comp_running": None,
+    "comp_frq": None,
+    "comp_total_run_hours": None,
+    "fan_total_run_hours": None,
+    "pressure_h": None,
+    "pressure_l": None,
+}
+
+
+def build_kjr86t3_table_query(table: int) -> str:
+    """Return the read-only table query frame for ``table``."""
+    body = [0x01, (table >> 8) & 0xFF, table & 0xFF]
+    body += [0x00] * (KJR86T3_QUERY_BODY_LEN - len(body))
+    frame = [0xAA, 0, 0xC3, 0, 0, 0, 0, 0, 0, 0x03, *body]
+    frame[1] = len(frame)
+    frame.append((~sum(frame[1:]) + 1) & 0xFF)
+    return bytes(frame).hex()
+
+
+def kjr86t3_table_matches(body: bytearray | bytes, table: int) -> bool:
+    """Return whether ``body`` is a real reply for ``table`` (not an echo).
+
+    An echoed request starts with 0x01; a device reply starts with 0x00.
+    """
+    return (
+        len(body) > 12
+        and body[0] == 0x00
+        and body[1] == (table >> 8) & 0xFF
+        and body[2] == table & 0xFF
+    )
+
+
+def _kjr86t3_u16(body: bytearray | bytes, index: int) -> int | None:
+    if len(body) < index + 2:
+        return None
+    raw = (body[index] << 8) | body[index + 1]
+    if raw in _KJR86T3_INVALID_U16:
+        return None
+    return raw - 0x10000 if raw & 0x8000 else raw
+
+
+def _kjr86t3_temp(body: bytearray | bytes, index: int) -> float | None:
+    raw = _kjr86t3_u16(body, index)
+    return None if raw is None else raw / 10
+
+
+def decode_kjr86t3_status(
+    settings: bytearray | bytes, params: bytearray | bytes,
+) -> ITSStatus:
+    """Decode KJR-86T3 tables 500 (settings) and 1000 (parameters)."""
+    status = dataclasses.replace(ITSStatus(), **_KJR86T3_UNEXPOSED_STATUS)
+    status.raw_body = bytes(settings)
+    status.error_code = 0
+
+    # Query mode 1 ("Heat") maps to HVACMode.HEAT in climate.py, so a powered
+    # DHW unit reads ON; the controller's own mode byte (0x40) is not a C3 mode.
+    if len(settings) > KJR86T3_POWER_INDEX:
+        power_on = settings[KJR86T3_POWER_INDEX] != 0
+        status.mode = 1 if power_on else 0
+        status.mode_name = "Heat" if power_on else "Off"
+
+    setpoint = _kjr86t3_temp(settings, KJR86T3_SETPOINT_INDEX)
+    if setpoint is not None:
+        status.t5s_def = setpoint
+        status.set_temperature = int(setpoint)
+
+    if len(params) >= KJR86T3_ENERGY_INDEX + 4:
+        raw = int.from_bytes(params[KJR86T3_ENERGY_INDEX:KJR86T3_ENERGY_INDEX + 4], "big")
+        if raw != 0xFFFFFFFF:
+            status.total_kwh = raw / 100
+
+    return status
+
+
+def decode_kjr86t3_sensors(
+    params: bytearray | bytes, icons: bytearray | bytes,
+) -> ITSSensors:
+    """Decode KJR-86T3 tables 1000 (parameters) and 900 (display icons).
+
+    The DHW tank temperature (the value the app shows) is routed to
+    ``th_temp``, the field the "DHW Tank Temperature" sensor reads. The
+    controller's own Th probe is not exposed, so that slot is not reused.
+    """
+    sensors = ITSSensors()
+    sensors.raw_body = bytes(params)
+    sensors.th_temp = _kjr86t3_temp(icons, KJR86T3_TANK_TEMP_INDEX)
+    sensors.tp_temp = _kjr86t3_temp(params, KJR86T3_TP_INDEX)
+    sensors.t3_temp = _kjr86t3_temp(params, KJR86T3_T3_INDEX)
+    sensors.t4_temp = _kjr86t3_temp(params, KJR86T3_T4_INDEX)
+    sensors.odu_voltage = _kjr86t3_u16(params, KJR86T3_VOLTAGE_INDEX)
+    sensors.tf_temp = None
+    sensors.odu_current = None
+    return sensors
+
+
 def apply_profile_to_status(profile: ModelProfile, status: ITSStatus) -> ITSStatus:
     """Return the profile-canonical ITSStatus for a decoded status object.
 
@@ -490,6 +626,9 @@ def apply_profile_to_sensors(
 __all__ = [
     "AQUAPURA_SN8",
     "ATW_SN8",
+    "KJR86T3_SN8",
+    "KJR86T3_TEMP_MAX",
+    "KJR86T3_TEMP_MIN",
     "KJRH120L_DHW_OFF",
     "KJRH120L_DHW_ON",
     "KJRH120L_DHW_TEMP_MAX",
@@ -501,10 +640,14 @@ __all__ = [
     "apply_profile_to_sensors",
     "apply_profile_to_status",
     "atw_sensors_are_placeholder",
+    "build_kjr86t3_table_query",
     "build_kjrh120l_set_temperature",
     "build_query_command",
     "decode_atw_status",
+    "decode_kjr86t3_sensors",
+    "decode_kjr86t3_status",
     "decode_kjrh120l_status",
+    "kjr86t3_table_matches",
     "kjrh120l_has_zone1",
     "resolve_profile",
 ]

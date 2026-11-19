@@ -766,12 +766,15 @@ class ILetComfortClient:
         """
         # Imported lazily to avoid a circular import (model_profiles imports api).
         from .model_profiles import (
+            ModelProfile,
             apply_profile_to_status,
             build_query_command,
             resolve_profile,
         )
 
         profile = resolve_profile(sn8)
+        if profile is ModelProfile.KJR86T3:
+            return self._query_kjr86t3_status(appliance_code)
         command = build_query_command(profile, 0x01)
         response_hex = self.send_hex_command(appliance_code, command)
         _LOGGER.debug("query_status raw response: %s", response_hex)
@@ -796,9 +799,12 @@ class ILetComfortClient:
         ``ffff<ss><ss><ss>ff`` form. Unknown/None sn8 uses the standard frame.
         """
         # Imported lazily to avoid a circular import (model_profiles imports api).
-        from .model_profiles import build_query_command, resolve_profile
+        from .model_profiles import ModelProfile, build_query_command, resolve_profile
 
-        command = build_query_command(resolve_profile(sn8), 0x02)
+        profile = resolve_profile(sn8)
+        if profile is ModelProfile.KJR86T3:
+            return self._query_kjr86t3_sensors(appliance_code)
+        command = build_query_command(profile, 0x02)
         response_hex = self.send_hex_command(appliance_code, command)
         _LOGGER.debug("query_sensors raw response: %s", response_hex)
         raw = parse_hex_response(response_hex)
@@ -810,6 +816,45 @@ class ILetComfortClient:
                 f"unsupported. Raw: {response_hex}"
             )
         return decode_its_sensors(body)
+
+    def query_kjr86t3_table(self, appliance_code: str, table: int) -> bytearray:
+        """Read one KJR-86T3 table (issue #126) and return its reply body."""
+        from .model_profiles import build_kjr86t3_table_query, kjr86t3_table_matches
+
+        response_hex = self.send_hex_command(
+            appliance_code, build_kjr86t3_table_query(table),
+        )
+        _LOGGER.debug("query table %d raw response: %s", table, response_hex)
+        raw = parse_hex_response(response_hex)
+        _body_type, body = extract_c3_body(raw)
+        if not kjr86t3_table_matches(body, table):
+            raise ApiError(
+                f"Table {table} query returned no device data; device may be "
+                f"offline. Raw: {response_hex}"
+            )
+        return body
+
+    def _query_kjr86t3_status(self, appliance_code: str) -> ITSStatus:
+        from .model_profiles import (
+            KJR86T3_TABLE_PARAMS,
+            KJR86T3_TABLE_SETTINGS,
+            decode_kjr86t3_status,
+        )
+
+        settings = self.query_kjr86t3_table(appliance_code, KJR86T3_TABLE_SETTINGS)
+        params = self.query_kjr86t3_table(appliance_code, KJR86T3_TABLE_PARAMS)
+        return decode_kjr86t3_status(settings, params)
+
+    def _query_kjr86t3_sensors(self, appliance_code: str) -> ITSSensors:
+        from .model_profiles import (
+            KJR86T3_TABLE_ICONS,
+            KJR86T3_TABLE_PARAMS,
+            decode_kjr86t3_sensors,
+        )
+
+        params = self.query_kjr86t3_table(appliance_code, KJR86T3_TABLE_PARAMS)
+        icons = self.query_kjr86t3_table(appliance_code, KJR86T3_TABLE_ICONS)
+        return decode_kjr86t3_sensors(params, icons)
 
     def set_device(
         self,
@@ -836,6 +881,11 @@ class ILetComfortClient:
         """
         # Imported lazily to avoid a circular import (model_profiles imports api).
         from .model_profiles import ModelProfile, resolve_profile
+
+        if resolve_profile(sn8) is ModelProfile.KJR86T3:
+            # The standard C3 SET frame is unvalidated on this table-based
+            # controller; never send it (issue #126).
+            raise ApiError("Control is not supported yet for the KJR-86T3 controller")
 
         if resolve_profile(sn8) is ModelProfile.KJRH120L:
             return self._set_device_kjrh120l(
