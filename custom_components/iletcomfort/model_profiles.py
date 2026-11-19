@@ -459,7 +459,10 @@ KJR86T3_TABLE_PARAMS = 1000
 KJR86T3_QUERY_BODY_LEN = 16
 
 KJR86T3_POWER_INDEX = 13  # table 500, u8s_power_on
+KJR86T3_MODE_INDEX = 14  # table 500, u8s_mode (0x40 = Eco)
 KJR86T3_SETPOINT_INDEX = 15  # table 500, u16s_t5s (x10)
+KJR86T3_SILENCE_INDEX = 17  # table 500, u8s_silence_active
+KJR86T3_SMART_GRID_INDEX = 20  # table 500, u8s_smart_grid_active ("SG ready")
 KJR86T3_TANK_TEMP_INDEX = 30  # table 900, u16_icons_temp (x10)
 KJR86T3_TP_INDEX = 43  # table 1000, u16_parm_tp (x10)
 KJR86T3_TH_INDEX = 45  # table 1000, u16_parm_th (x10)
@@ -493,6 +496,61 @@ def build_kjr86t3_table_query(table: int) -> str:
     frame[1] = len(frame)
     frame.append((~sum(frame[1:]) + 1) & 0xFF)
     return bytes(frame).hex()
+
+
+# Writes (validated on hardware for table 500: setpoint and silence):
+# message type 0x02, body ``00 <table u16 BE> ff ff 83 ff 00`` + data, where a
+# field read at reply body[k] is written at body[k - 4] (the write header has
+# no ``ff ff ff <period>`` block) and 0xff leaves a byte unchanged. The body
+# keeps the reply's length. The device answers with the updated table; an
+# echo of the command means it was rejected.
+KJR86T3_WRITE_SHIFT = 4
+KJR86T3_WRITE_HEADER = (0xFF, 0xFF, 0x83, 0xFF, 0x00)
+KJR86T3_TABLE_SETTINGS_LEN = 36
+# Byte 13 (power) is not applied through this table; power stays app-only
+# until its write is found.
+KJR86T3_WRITABLE_SETTINGS = frozenset(
+    {KJR86T3_SETPOINT_INDEX, KJR86T3_SETPOINT_INDEX + 1, KJR86T3_SILENCE_INDEX}
+)
+
+
+def build_kjr86t3_write(
+    table: int, fields: dict[int, int], body_len: int = KJR86T3_TABLE_SETTINGS_LEN,
+) -> str:
+    """Return a sparse write frame setting ``fields`` (reply index -> byte)."""
+    body = [0x00, (table >> 8) & 0xFF, table & 0xFF, *KJR86T3_WRITE_HEADER]
+    body += [0xFF] * (body_len - len(body))
+    for index, value in fields.items():
+        pos = index - KJR86T3_WRITE_SHIFT
+        if not len(KJR86T3_WRITE_HEADER) + 3 <= pos < body_len:
+            raise ValueError(f"table {table} index {index} is not writable")
+        body[pos] = value & 0xFF
+    frame = [0xAA, 0, 0xC3, 0, 0, 0, 0, 0, 0, 0x02, *body]
+    frame[1] = len(frame)
+    frame.append((~sum(frame[1:]) + 1) & 0xFF)
+    return bytes(frame).hex()
+
+
+def build_kjr86t3_settings_write(
+    *, setpoint: int | None = None, silence: bool | None = None,
+) -> str:
+    """Return the table-500 write for a DHW setpoint and/or silent mode."""
+    fields: dict[int, int] = {}
+    if setpoint is not None:
+        if not KJR86T3_TEMP_MIN <= setpoint <= KJR86T3_TEMP_MAX:
+            raise ValueError(
+                f"Temperature {setpoint}C out of range "
+                f"(allowed: {KJR86T3_TEMP_MIN}-{KJR86T3_TEMP_MAX}C)"
+            )
+        raw = setpoint * 10
+        fields[KJR86T3_SETPOINT_INDEX] = raw >> 8
+        fields[KJR86T3_SETPOINT_INDEX + 1] = raw & 0xFF
+    if silence is not None:
+        fields[KJR86T3_SILENCE_INDEX] = 1 if silence else 0
+    if not fields:
+        raise ValueError("nothing to write")
+    assert set(fields) <= KJR86T3_WRITABLE_SETTINGS
+    return build_kjr86t3_write(KJR86T3_TABLE_SETTINGS, fields)
 
 
 def kjr86t3_table_matches(body: bytearray | bytes, table: int) -> bool:
@@ -541,6 +599,12 @@ def decode_kjr86t3_status(
     if setpoint is not None:
         status.t5s_def = setpoint
         status.set_temperature = int(setpoint)
+
+    if len(settings) > KJR86T3_SMART_GRID_INDEX:
+        status.kjr86t3_mode = settings[KJR86T3_MODE_INDEX]
+        status.kjr86t3_silence = settings[KJR86T3_SILENCE_INDEX] == 1
+        status.mute_valid = status.kjr86t3_silence
+        status.kjr86t3_smart_grid = settings[KJR86T3_SMART_GRID_INDEX] == 1
 
     if len(params) >= KJR86T3_ENERGY_INDEX + 4:
         raw = int.from_bytes(params[KJR86T3_ENERGY_INDEX:KJR86T3_ENERGY_INDEX + 4], "big")

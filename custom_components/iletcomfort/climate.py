@@ -126,6 +126,9 @@ class ILetComfortClimate(CoordinatorEntity[ILetComfortCoordinator], ClimateEntit
     def supported_features(self) -> ClimateEntityFeature:
         if self._is_kjrh120l_dual:
             return ClimateEntityFeature(0)
+        if self._profile is ModelProfile.KJR86T3:
+            # Only the setpoint write is validated; power stays in the app.
+            return ClimateEntityFeature.TARGET_TEMPERATURE
         if self.hvac_mode is HVACMode.FAN_ONLY:
             return (
                 self._attr_supported_features

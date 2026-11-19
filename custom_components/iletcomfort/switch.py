@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import ILetComfortCoordinator
 from .entity import build_device_info
+from .model_profiles import ModelProfile, resolve_profile
 
 
 async def async_setup_entry(
@@ -36,6 +37,13 @@ class ILetComfortBoostSwitch(CoordinatorEntity[ILetComfortCoordinator], SwitchEn
         super().__init__(coordinator)
         self._attr_unique_id = f"{coordinator.appliance_code}_boost"
         self._attr_device_info = build_device_info(coordinator)
+
+    @property
+    def available(self) -> bool:
+        # Boost has no known write on the KJR-86T3 (issue #126).
+        if resolve_profile(self.coordinator.sn8) is ModelProfile.KJR86T3:
+            return False
+        return super().available
 
     @property
     def is_on(self) -> bool:

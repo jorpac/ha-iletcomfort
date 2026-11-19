@@ -294,6 +294,10 @@ class ITSStatus:
     fan_total_run_hours: int = 0
     # KJRH-120L dual variant's separate DHW target (status body[15], issue #5).
     kjrh120l_dhw_setpoint: float | None = None
+    # KJR-86T3 table-500 settings (issue #126).
+    kjr86t3_mode: int | None = None
+    kjr86t3_silence: bool | None = None
+    kjr86t3_smart_grid: bool | None = None
     raw_body: bytes = field(default_factory=bytes, repr=False)
 
 
@@ -883,9 +887,15 @@ class ILetComfortClient:
         from .model_profiles import ModelProfile, resolve_profile
 
         if resolve_profile(sn8) is ModelProfile.KJR86T3:
-            # The standard C3 SET frame is unvalidated on this table-based
-            # controller; never send it (issue #126).
-            raise ApiError("Control is not supported yet for the KJR-86T3 controller")
+            # Never the standard C3 SET frame on this table-based controller.
+            return self._set_device_kjr86t3(
+                appliance_code,
+                mode=mode,
+                temperature=temperature,
+                boost=boost,
+                mute=mute,
+                power_on=power_on,
+            )
 
         if resolve_profile(sn8) is ModelProfile.KJRH120L:
             return self._set_device_kjrh120l(
@@ -977,6 +987,49 @@ class ILetComfortClient:
             "effective_mode": eff_mode,
             "effective_temp": eff_temp,
         }
+
+    def _set_device_kjr86t3(
+        self,
+        appliance_code: str,
+        *,
+        mode: int | None,
+        temperature: int | None,
+        boost: bool | None,
+        mute: int | None,
+        power_on: bool,
+    ) -> dict[str, Any]:
+        """Write DHW setpoint and/or silent mode to a KJR-86T3 (issue #126).
+
+        Only the hardware-validated table-500 fields are written. Power, mode
+        and boost writes are not known yet and are refused without sending.
+        """
+        from .model_profiles import (
+            KJR86T3_TABLE_SETTINGS,
+            build_kjr86t3_settings_write,
+            kjr86t3_table_matches,
+        )
+
+        if power_on or mode is not None or boost:
+            raise ApiError(
+                "Power, mode and boost control are not supported yet for the "
+                "KJR-86T3 controller; use the iLetComfort app"
+            )
+        command = build_kjr86t3_settings_write(
+            setpoint=temperature,
+            silence=None if mute is None else mute != 0,
+        )
+        response_hex = self.send_hex_command(appliance_code, command)
+        _LOGGER.debug("kjr86t3 write %s -> %s", command, response_hex)
+        raw = parse_hex_response(response_hex)
+        _body_type, body = extract_c3_body(raw)
+        # A write body also starts with 00 <table>, so compare with the command.
+        if bytes(raw).hex() == command or not kjr86t3_table_matches(
+            body, KJR86T3_TABLE_SETTINGS,
+        ):
+            raise ApiError(
+                f"KJR-86T3 rejected the write (echoed). Raw: {response_hex}"
+            )
+        return {"sent": command, "response": response_hex}
 
     def _set_device_kjrh120l(
         self,

@@ -12,7 +12,10 @@ from .const import DOMAIN
 from .coordinator import ILetComfortCoordinator
 from .entity import build_device_info
 
+from .model_profiles import ModelProfile, resolve_profile
+
 MUTE_OPTIONS = ["Off", "Level 1", "Level 2"]
+KJR86T3_MUTE_OPTIONS = ["Off", "On"]
 _MUTE_TO_API = {"Off": 0, "Level 1": 1, "Level 2": 2}
 
 
@@ -40,9 +43,21 @@ class ILetComfortMuteSelect(CoordinatorEntity[ILetComfortCoordinator], SelectEnt
         self._attr_device_info = build_device_info(coordinator)
 
     @property
+    def _is_kjr86t3(self) -> bool:
+        return resolve_profile(self.coordinator.sn8) is ModelProfile.KJR86T3
+
+    @property
+    def options(self) -> list[str]:
+        # The KJR-86T3 silent mode is a single on/off flag.
+        return KJR86T3_MUTE_OPTIONS if self._is_kjr86t3 else MUTE_OPTIONS
+
+    @property
     def current_option(self) -> str:
         if self.coordinator.data is None:
             return "Off"
+        if self._is_kjr86t3:
+            status = self.coordinator.data.get("status")
+            return "On" if status is not None and status.kjr86t3_silence else "Off"
         sensors = self.coordinator.data.get("sensors")
         if sensors is None or sensors.ctrl_flag != 1:
             return "Off"
@@ -50,4 +65,7 @@ class ILetComfortMuteSelect(CoordinatorEntity[ILetComfortCoordinator], SelectEnt
         return "Level 2" if sensors.mute_level == 1 else "Level 1"
 
     async def async_select_option(self, option: str) -> None:
+        if self._is_kjr86t3:
+            await self.coordinator.async_set_device(mute=0 if option == "Off" else 1)
+            return
         await self.coordinator.async_set_device(mute=_MUTE_TO_API[option])

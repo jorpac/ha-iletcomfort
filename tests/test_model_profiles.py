@@ -890,10 +890,91 @@ def test_query_kjr86t3_table_echo_raises():
         client.query_kjr86t3_table("APPL1", 500)
 
 
-def test_set_device_kjr86t3_never_sends_a_frame():
+
+
+# --- KJR-86T3 writes (table 500), validated on hardware (issue #126) ---
+
+
+def test_build_kjr86t3_settings_write_matches_hardware_frames():
+    from custom_components.iletcomfort.model_profiles import (
+        build_kjr86t3_settings_write,
+    )
+
+    # These exact frames moved the setpoint 55 -> 54 -> 55 C on the device.
+    assert build_kjr86t3_settings_write(setpoint=55) == (
+        "aa2ec3000000000000020001f4ffff83ff00ffffff0226"
+        "ffffffffffffffffffffffffffffffffffffffffffffff8a"
+    )
+    frame = bytes.fromhex(build_kjr86t3_settings_write(setpoint=54, silence=False))
+    body = frame[10:-1]
+    assert len(body) == 36
+    assert body[11:14] == bytes([0x02, 0x1C, 0x00])  # setpoint 54.0, silence off
+    assert sum(frame[1:]) & 0xFF == 0
+
+
+def test_build_kjr86t3_settings_write_rejects_out_of_range():
+    from custom_components.iletcomfort.model_profiles import (
+        build_kjr86t3_settings_write,
+    )
+
+    with pytest.raises(ValueError):
+        build_kjr86t3_settings_write(setpoint=75)
+    with pytest.raises(ValueError):
+        build_kjr86t3_settings_write()
+
+
+def test_decode_kjr86t3_status_silence_and_mode():
+    body = bytearray(KJR86T3_TABLE_500)
+    status = decode_kjr86t3_status(body, KJR86T3_TABLE_1000)
+    assert status.kjr86t3_mode == 0x40
+    assert status.kjr86t3_silence is False
+    assert status.kjr86t3_smart_grid is True
+    body[17] = 1
+    assert decode_kjr86t3_status(body, KJR86T3_TABLE_1000).kjr86t3_silence is True
+
+
+def test_set_device_kjr86t3_writes_setpoint_and_accepts_table_reply():
+    from custom_components.iletcomfort.model_profiles import (
+        build_kjr86t3_settings_write,
+    )
+
+    client = _make_client()
+    reply = _kjr86t3_frame(KJR86T3_TABLE_500)
+    with patch_send(client, reply) as send:
+        client.set_device("APPL1", sn8=KJR86T3_SN8, temperature=54)
+    send.assert_called_once_with("APPL1", build_kjr86t3_settings_write(setpoint=54))
+
+
+def test_set_device_kjr86t3_silence_write():
+    from custom_components.iletcomfort.model_profiles import (
+        build_kjr86t3_settings_write,
+    )
+
+    client = _make_client()
+    with patch_send(client, _kjr86t3_frame(KJR86T3_TABLE_500)) as send:
+        client.set_device("APPL1", sn8=KJR86T3_SN8, mute=1)
+    send.assert_called_once_with("APPL1", build_kjr86t3_settings_write(silence=True))
+
+
+def test_set_device_kjr86t3_echo_raises():
+    from custom_components.iletcomfort.api import ApiError
+    from custom_components.iletcomfort.model_profiles import (
+        build_kjr86t3_settings_write,
+    )
+
+    client = _make_client()
+    echo = build_kjr86t3_settings_write(setpoint=54)
+    with patch_send(client, echo), pytest.raises(ApiError):
+        client.set_device("APPL1", sn8=KJR86T3_SN8, temperature=54)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"power_on": True}, {"mode": 0}, {"boost": True}],
+)
+def test_set_device_kjr86t3_unvalidated_controls_never_send(kwargs):
     from custom_components.iletcomfort.api import ApiError
 
     client = _make_client()
     with patch_send(client, "") as send, pytest.raises(ApiError):
-        client.set_device("APPL1", sn8=KJR86T3_SN8, temperature=50)
+        client.set_device("APPL1", sn8=KJR86T3_SN8, **kwargs)
     send.assert_not_called()
